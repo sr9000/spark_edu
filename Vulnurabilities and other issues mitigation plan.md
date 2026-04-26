@@ -168,6 +168,21 @@ Expected result: startup order is explicit and easier to maintain.
 Phase 3 improves responsiveness under load. These changes are less urgent than
 security fixes, but they become important as traffic and data size grow.
 
+Visual overview: Phase 3 keeps the API worker focused on short request/response
+work. Slow calls, repeated database trips, and shared counters are moved to
+places that can be scaled or bounded separately.
+
+```mermaid
+flowchart LR
+    Client[Client request] --> API[FastAPI worker]
+    API --> DB[(Database)]
+    API --> Queue[Background queue]
+    Queue --> Worker[Worker process]
+    Worker --> AI[AI moderation provider]
+    API --> Media[Cloudinary via executor]
+    API --> Redis[(Redis counters)]
+```
+
 ### Step 7. Move AI moderation to a background worker
 
 Current issue: lesson publishing waits for AI moderation inside the HTTP request.
@@ -181,6 +196,24 @@ lesson status after it receives a verdict.
 Expected result: publishing returns quickly, and moderation capacity can be
 scaled independently from API capacity.
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant Q as Queue
+    participant W as Worker
+    participant M as Moderation provider
+
+    C->>A: Publish lesson
+    A->>A: Save lesson as pending review
+    A->>Q: Enqueue moderation job
+    A-->>C: Return quickly
+    W->>Q: Pick up job
+    W->>M: Check lesson content
+    M-->>W: Return verdict
+    W->>A: Update lesson status
+```
+
 ### Step 8. Prevent Cloudinary calls from blocking the event loop
 
 Current issue: Cloudinary upload and delete operations are synchronous calls used
@@ -191,6 +224,14 @@ compatible wrapper if one is adopted later.
 
 Expected result: one slow media operation no longer delays unrelated async
 requests on the same worker.
+
+```mermaid
+flowchart TD
+    A[Async API handler] --> B{Media operation?}
+    B -- No --> C[Continue on event loop]
+    B -- Yes --> D[Run Cloudinary SDK call in executor thread]
+    D --> E[Return result to async handler]
+```
 
 ### Step 9. Remove the learned-lessons N+1 query
 
@@ -203,6 +244,20 @@ or SQLAlchemy eager loading.
 Expected result: the endpoint performs consistently as the number of learned
 lessons increases.
 
+```mermaid
+flowchart LR
+    subgraph Before[N+1 pattern]
+        A[Fetch learned rows] --> B[Loop]
+        B --> C[Fetch lesson 1]
+        B --> D[Fetch lesson 2]
+        B --> E[Fetch more lessons]
+    end
+
+    subgraph After[Joined or eager-loaded query]
+        F[Fetch learned rows with lesson data] --> G[Return response]
+    end
+```
+
 ### Step 10. Add pagination to list endpoints
 
 Current issue: list endpoints can return all rows at once.
@@ -213,6 +268,14 @@ endpoints. Enforce a maximum page size on the server.
 Expected result: list responses stay bounded in size, which protects the server
 and improves client behavior.
 
+```mermaid
+flowchart LR
+    C[Client] -->|limit + offset or cursor| A[API list endpoint]
+    A -->|bounded query| D[(Database)]
+    D -->|one page| A
+    A -->|items + next page marker| C
+```
+
 ### Step 11. Move rate-limit state to Redis
 
 Current issue: in-memory rate limiting only applies inside one process. With
@@ -222,6 +285,17 @@ Mitigation: configure the rate limiter with Redis storage so all replicas share
 the same counters.
 
 Expected result: rate limits remain accurate when the API is scaled out.
+
+```mermaid
+flowchart LR
+    C[Client requests] --> LB[Load balancer]
+    LB --> A1[API replica 1]
+    LB --> A2[API replica 2]
+    LB --> A3[API replica 3]
+    A1 --> R[(Shared Redis rate-limit counters)]
+    A2 --> R
+    A3 --> R
+```
 
 ## Phase 4 — Operational polish
 
